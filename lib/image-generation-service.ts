@@ -175,6 +175,15 @@ function extractFromObject(data: unknown): ExtractedImage | null {
     if (typeof value === "string" && /^https?:\/\//i.test(value.trim())) {
       return { kind: "url", url: value.trim(), revisedPrompt };
     }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === "string" && /^https?:\/\//i.test(item.trim())) {
+          return { kind: "url", url: item.trim(), revisedPrompt };
+        }
+        const nested = extractFromObject(item);
+        if (nested) return { ...nested, revisedPrompt: nested.revisedPrompt || revisedPrompt };
+      }
+    }
     if (value && typeof value === "object") {
       const nested = (value as Record<string, unknown>).url;
       if (typeof nested === "string" && /^https?:\/\//i.test(nested.trim())) {
