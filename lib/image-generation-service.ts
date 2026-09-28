@@ -34,6 +34,12 @@ type ImageGenerationApiResponse = {
   revisedPrompt?: string;
 };
 
+type AsyncImageTask = {
+  id: string;
+  status?: string;
+  error?: string;
+};
+
 const IMAGE_MODEL_HINTS = [
   "image",
   "img",
@@ -177,7 +183,7 @@ function extractFromObject(data: unknown): ExtractedImage | null {
     }
   }
 
-  for (const key of ["data", "images", "output", "content"]) {
+  for (const key of ["data", "images", "output", "content", "result"]) {
     const value = record[key];
     if (Array.isArray(value)) {
       for (const item of value) {
@@ -189,10 +195,92 @@ function extractFromObject(data: unknown): ExtractedImage | null {
         const nested = extractFromObject(item);
         if (nested) return { ...nested, revisedPrompt: nested.revisedPrompt || revisedPrompt };
       }
+    } else if (value && typeof value === "object") {
+      const nested = extractFromObject(value);
+      if (nested) return { ...nested, revisedPrompt: nested.revisedPrompt || revisedPrompt };
     }
   }
 
   return null;
+}
+
+function extractAsyncImageTask(data: unknown): AsyncImageTask | null {
+  if (!data || typeof data !== "object") return null;
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const task = extractAsyncImageTask(item);
+      if (task) return task;
+    }
+    return null;
+  }
+
+  const record = data as Record<string, unknown>;
+  const rawId = record.task_id ?? record.taskId ?? record.id;
+  if (typeof rawId === "string" && rawId.trim() && (/^task_/i.test(rawId) || "task_id" in record || "taskId" in record)) {
+    const errorRecord = record.error && typeof record.error === "object"
+      ? record.error as Record<string, unknown>
+      : null;
+    return {
+      id: rawId.trim(),
+      status: typeof record.status === "string" ? record.status.toLowerCase() : undefined,
+      error: typeof record.error === "string"
+        ? record.error
+        : typeof errorRecord?.message === "string"
+          ? errorRecord.message
+          : undefined,
+    };
+  }
+
+  for (const key of ["data", "result", "task"]) {
+    const task = extractAsyncImageTask(record[key]);
+    if (task) return task;
+  }
+  return null;
+}
+
+function waitForTaskPoll(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function pollAsyncImageTask(params: {
+  task: AsyncImageTask;
+  baseUrl: string;
+  headers: Record<string, string>;
+  signal?: AbortSignal;
+}): Promise<ExtractedImage> {
+  let task = params.task;
+  const taskUrl = `${normalizeBaseUrl(params.baseUrl)}/tasks/${encodeURIComponent(task.id)}`;
+
+  for (;;) {
+    const status = task.status?.toLowerCase();
+    if (["failed", "error", "cancelled", "canceled"].includes(status || "")) {
+      throw new Error(`生图任务失败${task.error ? `：${task.error}` : ""}`);
+    }
+    await waitForTaskPoll(2_000, params.signal);
+    const res = await fetch(taskUrl, { method: "GET", headers: params.headers, signal: params.signal });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`生图任务查询失败 ${res.status}: ${text.slice(0, 600)}`);
+    }
+    const json = await res.json();
+    const extracted = extractFromObject(json);
+    if (extracted) return extracted;
+    task = extractAsyncImageTask(json) || task;
+  }
 }
 
 function extractModels(data: unknown): string[] {
@@ -236,7 +324,11 @@ async function fetchImageUrlAsBase64(url: string, signal?: AbortSignal): Promise
   return { b64: cleaned.b64, mimeType: cleaned.mimeType || blob.type || "image/png" };
 }
 
-async function parseImageGenerationResponse(res: Response, signal?: AbortSignal): Promise<ImageGenerationApiResponse> {
+async function parseImageGenerationResponse(
+  res: Response,
+  signal?: AbortSignal,
+  asyncTask?: { baseUrl: string; headers: Record<string, string> },
+): Promise<ImageGenerationApiResponse> {
   throwIfAborted(signal);
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   if (!res.ok) {
@@ -254,7 +346,11 @@ async function parseImageGenerationResponse(res: Response, signal?: AbortSignal)
 
   const json = await res.json();
   throwIfAborted(signal);
-  const extracted = extractFromObject(json);
+  let extracted = extractFromObject(json);
+  if (!extracted && asyncTask) {
+    const task = extractAsyncImageTask(json);
+    if (task) extracted = await pollAsyncImageTask({ task, ...asyncTask, signal });
+  }
   if (!extracted) {
     throw new Error(`生图 API 返回中没有找到图片字段：${JSON.stringify(Object.keys(json || {})).slice(0, 200)}`);
   }
@@ -363,7 +459,11 @@ async function generateImageDirect(params: {
   if (signal) signal.addEventListener("abort", onOuterAbort, { once: true });
   const totalTimer = setTimeout(() => controller.abort(), 360_000);
   try {
-    return await parseImageGenerationResponse(await fetch(url, { method: "POST", headers, body, signal: controller.signal }), signal);
+    return await parseImageGenerationResponse(
+      await fetch(url, { method: "POST", headers, body, signal: controller.signal }),
+      controller.signal,
+      { baseUrl: proxyBaseUrl || settings.baseUrl, headers },
+    );
   } catch (error) {
     if (controller.signal.aborted && !signal?.aborted) {
       throw new Error(proxyBaseUrl ? "生图代理超时（360 秒未返回）" : "生图请求超时（360 秒未返回）");
